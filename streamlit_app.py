@@ -681,7 +681,7 @@ else:
     # ABCD formulas — inline math, indented within the right pane
     spacer, eqcol = st.columns([1.2, 1.8])
     with eqcol:
-        PAD = 0.35
+        PAD = 0.2
         gutter, body = st.columns([PAD, 1 - PAD])
         with body:
             st.markdown("---")
