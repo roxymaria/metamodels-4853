@@ -25,7 +25,7 @@ NOTE_BAND  = (55.0, 392.0)      # A1..G4
 N_MIN, N_MAX, N_STEP = 15, 200, 5
 TRAIN_MIN, TRAIN_MAX, TRAIN_STEP = 0.50, 0.80, 0.05
 
-COL_TRAIN = "#ff0000"   # dark orange
+COL_TRAIN = "#ff8400"   # dark orange
 COL_TEST  = "#ffffff"   # white
 COL_EDGE  = "#000000"   # black
 GRID_FAINT = "#E0E0E0"
@@ -82,7 +82,7 @@ def sample_design(design, n, Lmin, Lmax, Dmin, Dmax, seed=42):
         L = Lmin + U[:, 0] * (Lmax - Lmin)
         D = Dmin + U[:, 1] * (Dmax - Dmin)
 
-    elif design == "MC":
+    elif design == "Monte Carlo":
         U = rng.random((n, 2))
         k = None; n_eff = n
         L = Lmin + U[:, 0] * (Lmax - Lmin)
@@ -117,6 +117,210 @@ def natural_note_freqs(fmin=55.0, fmax=392.0):
 
 def format_d_cm():
     return FuncFormatter(lambda y, pos: f"{y*100:.0f}")
+
+def latex_left(expr: str):
+    # Left-align the *next* KaTeX blocks
+    st.markdown("<style>.katex-display{ text-align:left !important; }</style>", unsafe_allow_html=True)
+    st.latex(expr)
+
+def latex_center(expr: str):
+    # Center-align the *next* KaTeX blocks
+    st.markdown("<style>.katex-display{ text-align:center !important; }</style>", unsafe_allow_html=True)
+    st.latex(expr)
+
+_NOTE_NAMES = np.array(["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"])
+
+def _freq_to_midi(f: float) -> int:
+    # 12-TET mapping; A4=440 Hz. Round to nearest MIDI note.
+    return int(np.round(69 + 12*np.log2(float(f)/440.0)))
+
+def _midi_to_name(m: int) -> str:
+    name = _NOTE_NAMES[m % 12]
+    octave = m // 12 - 1
+    return f"{name}{octave}"
+
+def _note_diff_at_max_error(y_true: np.ndarray, y_pred: np.ndarray) -> str:
+    """Return label like 'A3→C4 (+3 st)' at the index of MaxAE."""
+    if y_pred.size == 0 or y_true.size == 0:
+        return ""
+    err = np.abs(y_true - y_pred)
+    i = int(np.argmax(err))
+    ft = float(y_true[i]); fp = float(y_pred[i])
+    # guard against nonpositive frequencies
+    if ft <= 0 or fp <= 0:
+        return ""
+    mt = _freq_to_midi(ft); mp = _freq_to_midi(fp)
+    dt = mp - mt
+    sign = "+" if dt >= 0 else ""
+    return f"{_midi_to_name(mt)}→{_midi_to_name(mp)}"
+
+# --- Musical keyboard helpers (drop-in) ------------------------------------
+_NOTE_NAMES = np.array(["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"])
+_WHITES = {0, 2, 4, 5, 7, 9, 11}
+_BLACKS = {1, 3, 6, 8, 10}
+
+def _freq_to_midi_float(f: float) -> float:
+    return 69.0 + 12.0*np.log2(float(f)/440.0)
+
+def _freq_to_midi_rounded(f: float) -> int:
+    return int(np.round(_freq_to_midi_float(f)))
+
+def _is_white(pc: int) -> bool: return pc in _WHITES
+def _is_black(pc: int) -> bool: return pc in _BLACKS
+
+def _keyboard_window(m_true: int, m_pred: int, *, octaves: int = 3) -> tuple[int,int]:
+    """
+    Pick a 3-octave [start,end] (inclusive) that includes both m_true and m_pred.
+    Snap the start to a C (multiple of 12). Keeps the window stable in size.
+    """
+    span = 12 * octaves         # number of semitones
+    half = span // 2            # 18 for 3 octaves
+    m_min, m_max = sorted((m_true, m_pred))
+
+    # Try centering the window on the midpoint, then snap start to C.
+    m_mid = int(np.round((m_min + m_max) / 2))
+    start_guess = m_mid - half
+    start = (start_guess // 12) * 12   # snap down to C
+    end = start + span - 1
+
+    # If either note falls out, adjust to include both (still snapped to C).
+    if m_min < start or m_max > end:
+        # Ensure top fits
+        start = int(np.ceil((m_max - (span - 1)) / 12.0)) * 12
+        end = start + span - 1
+        # If bottom still out, slide down to include it
+        if m_min < start:
+            start = (m_min // 12) * 12
+            end = start + span - 1
+
+    return start, end
+
+
+## keyboard helpers
+def _freqs_to_midi_rounded(f_arr):
+    f = np.asarray(f_arr, dtype=float)
+    m = 69.0 + 12.0*np.log2(np.maximum(f, 1e-12)/440.0)
+    return np.round(m).astype(int)
+
+def pick_maxae_in_keyboard_range(y_true, y_pred, *, note_band=NOTE_BAND, octaves=3):
+    """
+    Return (idx, m_true, m_pred) for the test point that has the largest |error|
+    among samples whose **true note** lies inside the fixed 3-octave organ range.
+    If none are inside, returns (None, None, None).
+    """
+    if y_true.size == 0 or y_pred.size == 0:
+        return None, None, None
+    start, end = _fixed_keyboard_window(note_band, octaves)  # from your keyboard helper
+    m_true_all = _freqs_to_midi_rounded(y_true)
+    m_pred_all = _freqs_to_midi_rounded(y_pred)
+    mask = (m_true_all >= start) & (m_true_all <= end)  # only notes on the organ
+    if not np.any(mask):
+        return None, None, None
+    err = np.abs(y_true - y_pred)
+    idx_rel = int(np.argmax(err[mask]))
+    idx = int(np.flatnonzero(mask)[idx_rel])
+    return idx, int(m_true_all[idx]), int(m_pred_all[idx])
+
+
+def _fixed_keyboard_window(note_band=(55.0, 392.0), octaves: int = 3) -> tuple[int, int]:
+    """Start at the C at/below the low band edge; span exactly `octaves`."""
+    mmin = _freq_to_midi_float(note_band[0])
+    start = int(np.floor(mmin / 12.0) * 12)        # snap down to C
+    end = start + 12 * octaves - 1
+    return start, end
+
+def render_keyboard(m_true: int, m_pred: int, *,
+                    note_band=(55.0, 392.0), octaves: int = 3, fit_window: bool = False):
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle, Polygon
+
+    # Pick the window: fixed (with arrows for OOR) or auto-fit (always includes both)
+    if fit_window:
+        start, end = _keyboard_window(m_true, m_pred, octaves=octaves)
+    else:
+        start, end = _fixed_keyboard_window(note_band, octaves=octaves)
+
+    # Map x for whites
+    white_x, white_idx = {}, 0
+    for m in range(start, end + 1):
+        if _is_white(m % 12):
+            white_x[m] = white_idx
+            white_idx += 1
+    total_white = white_idx
+
+    # Figure
+    fig_w = max(6.0, total_white * 0.35)
+    fig, ax = plt.subplots(figsize=(fig_w, 1.6))
+    ax.set_xlim(0, total_white)
+    ax.set_ylim(0, 1.0)
+    ax.axis("off")
+
+    # 1) whites
+    for m in range(start, end + 1):
+        if _is_white(m % 12):
+            x = white_x[m]
+            ax.add_patch(Rectangle((x, 0.0), 1.0, 1.0, facecolor="white",
+                                   edgecolor="#444", linewidth=1.0, zorder=1))
+
+    # 2) white highlights
+    def _highlight_white(midi: int, color: str, alpha: float = 0.45):
+        if midi is None: return
+        if start <= midi <= end and _is_white(midi % 12):
+            x = white_x[midi]
+            ax.add_patch(Rectangle((x, 0.0), 1.0, 1.0,
+                                   facecolor=color, edgecolor=None, alpha=alpha, zorder=2))
+    _highlight_white(m_true, "#4dff00" )
+    _highlight_white(m_pred, "#ff0000" )
+
+    # Black center on the boundary line between whites (your preferred look)
+    def _black_center(midi: int) -> float:
+        left_white = midi - 1
+        return white_x[left_white] + 1.0  # center on the divider line
+
+    # 3) blacks
+    BK_W, BK_H, BK_Y = 0.62, 0.64, 0.36
+    for m in range(start, end + 1):
+        if _is_black(m % 12):
+            xc = _black_center(m)
+            x = xc - BK_W / 2
+            ax.add_patch(Rectangle((x, BK_Y), BK_W, BK_H,
+                                   facecolor="black", edgecolor="#222", linewidth=1.0, zorder=3))
+
+    # 4) black highlights
+    def _highlight_black(midi: int, color: str, alpha: float = 0.8):
+        if midi is None: return
+        if start <= midi <= end and _is_black(midi % 12):
+            xc = _black_center(midi)
+            x = xc - BK_W / 2
+            ax.add_patch(Rectangle((x, BK_Y), BK_W, BK_H,
+                                   facecolor=color, edgecolor=None, alpha=alpha, zorder=4))
+    _highlight_black(m_true, "tab:blue")
+    _highlight_black(m_pred, "tab:red")
+
+    # 5) out-of-range arrows at edges (blue=true, red=pred), stacked if both
+    def _edge_arrow(side: str, color: str, ymid: float):
+        w, h = 0.45, 0.40
+        if side == "left":
+            x_tip = 0.12
+            verts = [(x_tip, ymid), (x_tip + w, ymid + h/2), (x_tip + w, ymid - h/2)]
+        else:  # right
+            x_tip = total_white - 0.12
+            verts = [(x_tip, ymid), (x_tip - w, ymid + h/2), (x_tip - w, ymid - h/2)]
+        ax.add_patch(Polygon(verts, closed=True, facecolor=color, edgecolor="none", alpha=0.85, zorder=5))
+
+    if m_true < start: _edge_arrow("left",  "tab:blue", 0.72)
+    if m_pred < start: _edge_arrow("left",  "tab:red",  0.28)
+    if m_true > end:   _edge_arrow("right", "tab:blue", 0.72)
+    if m_pred > end:   _edge_arrow("right", "tab:red",  0.28)
+
+    # optional outer frame
+    ax.add_patch(Rectangle((0, 0), total_white, 1.0, facecolor="none", edgecolor="#ddd", linewidth=2.0, zorder=0))
+
+    fig.tight_layout(pad=0)
+    return fig
+
+
+
 
 # ---------- Plotting --------------------------------------------------------
 def plot_doe_preview(
@@ -158,9 +362,9 @@ def plot_doe_preview(
 
     if pts is not None:
         Lp, Dp, mask_train = pts
-        ax.scatter(Lp[~mask_train], Dp[~mask_train], s=36, edgecolors=COL_EDGE,
+        ax.scatter(Lp[~mask_train], Dp[~mask_train], s=60, edgecolors=COL_EDGE,
                    facecolors=COL_TEST, label="Test", zorder=3)
-        ax.scatter(Lp[ mask_train], Dp[ mask_train], s=36, edgecolors=COL_EDGE,
+        ax.scatter(Lp[ mask_train], Dp[ mask_train], s=60, edgecolors=COL_EDGE,
                    facecolors=COL_TRAIN, label="Train", zorder=3)
         ax.legend(loc="best", frameon=True)
 
@@ -179,7 +383,7 @@ def model_and_error_figs(
     CS1 = ax1.contourf(Lg, Dg, F_model, levels=24)
     fig1.colorbar(CS1, ax=ax1).set_label("f̂ (Hz)")
 
-    # Predicted note contours (always on)
+    # Predicted note contours 
     notes, _ = natural_note_freqs(*NOTE_BAND)
     if notes.size:
         cn_pred = ax1.contour(Lg, Dg, F_model, levels=notes, colors="k", linestyles=":")
@@ -266,9 +470,9 @@ def latex_poly_numeric(reg, labels):
 
 # ----------------------------- GPR helpers ---------------------------------
 def build_kernel(name: str):
-    if name == "RBF":
+    if name == "Radial Basis Function (RBF)":
         return C(1.0, (1e-3, 1e3)) * RBF(length_scale=(0.1, 0.05), length_scale_bounds=(1e-3, 1e3))
-    elif name == "RationalQuadratic":
+    elif name == "Rational Quadratic (RQ)":
         return C(1.0, (1e-3, 1e3)) * RationalQuadratic(length_scale=0.1, alpha=1.0,
                                                        length_scale_bounds=(1e-3, 1e3))
     else:
@@ -285,12 +489,14 @@ def predict_gpr(gpr, L, D): return gpr.predict(np.c_[L, D])
 
 def metrics_table(y_true, y_pred):
     if y_pred.size == 0:
-        return {"MAE": np.nan, "R²": np.nan, "MaxAE": np.nan}
+        return {"MAE": np.nan, "R²": np.nan, "MaxAE": np.nan, "Max Note Δ": ""}
     return {
         "MAE": float(mean_absolute_error(y_true, y_pred)),
         "R²":  float(r2_score(y_true, y_pred)),
-        "MaxAE": float(np.max(np.abs(y_true - y_pred)))
+        "MaxAE": float(np.max(np.abs(y_true - y_pred))),
+        # "Max Note Δ": _note_diff_at_max_error(y_true, y_pred),
     }
+
 
 # ---------------------------------- UI -------------------------------------
 st.title("Metamodel of a Stalactite Organ")
@@ -310,8 +516,12 @@ with left:
         st.markdown(
             """
 - Build a **metamodel** mapping stalactite geometry to **resonant frequency**.
-- Inputs: **Length L (m)** and **base diameter d (m)**.
-- Choose a **DOE**, then fit **Linear**, **Polynomial**, and **GPR** models.
+- Inputs: Length **L (m)** and base diameter **d (cm)**.
+- Choose a **DOE**, then run initial fits for Linear, Polynomial, and GPR **metamodels**.
+- Try: different DoEs & Training/Testing Splits. Can you minimize the number of experiments?
+- Try: different polynomial equation forms
+- Try: changing GPR kernels "influence rules"
+- Try: changing GPR noise level (too small -> GPR becomes unstable; too large -> GPR loses signal)
             """
         )
 
@@ -329,7 +539,7 @@ with right:
     # ---- Live toggle (dynamic) --------------------------------------------
     # This is the ONLY control that updates the preview without pressing Run DOE.
     live_truth_bg = st.checkbox(
-        "Show Theoretical Model",
+        "Show Dataset Model",
         value=(dd.get("show_truth_bg", False) if dd else False),
         key="doe_truth_bg_live",
         help="Toggle the ground-truth surface under the DOE preview."
@@ -354,12 +564,12 @@ with right:
 
         with c1:
             design = st.selectbox(
-                "Type", ["LHS", "Halton", "MC", "Grid"],
-                index=(["LHS","Halton","MC","Grid"].index(dd["design"]) if dd else 0)
+                "Type", ["Monte Carlo", "LHS", "Halton", "Grid"],
+                index=(["Monte Carlo", "LHS","Halton","Grid"].index(dd["design"]) if dd else 0)
             )
         with c2:
             n = st.slider("n", N_MIN, N_MAX,
-                          value=(int(dd["n_req"]) if dd else 25),
+                          value=(int(dd["n_req"]) if dd else 30),
                           step=N_STEP)
         with c3:
             default_train_pct = int(round(100*np.mean(dd["mask_train"]))) if dd else 60
@@ -384,7 +594,7 @@ with right:
         st.session_state["DOE"] = {
             "design": design, "n_req": n, "n_eff": n_eff, "k": k,
             "L": L, "D": D, "y": y, "mask_train": mask_train,
-            # persist whatever the live toggle is showing at submit time
+            
             "show_truth_bg": bool(live_truth_bg)
         }
         st.session_state["models_ready"] = False
@@ -402,6 +612,8 @@ elif btn_models:
 
 if not ss.get("models_ready", False):
     st.info("Results appear here after running initial models.")
+    st.stop()   # <— prevents Ltr/Dtr/ytr NameError and hides model UIs
+
 else:
     # ---- Gather split & grid
     dd = ss["DOE"]
@@ -419,7 +631,7 @@ else:
     # Right panel: HPs + metrics + overlay toggle (auto updates)
     with cols[2]:
         st.markdown("**Options**")
-        lin_overlay_truth = st.checkbox("Overlay ground-truth note lines (red)", value=False, key="lin_overlay_truth")
+        lin_overlay_truth = st.checkbox("Overlay Dataset Note Frequencies", value=False, key="lin_overlay_truth")
         st.markdown("**Error metrics (test)**")
         yte_hat_tmp = predict_linear(fit_linear(Ltr, Dtr, ytr), Lte, Dte) if len(Lte) else np.array([])
         st.table(pd.DataFrame([metrics_table(yte, yte_hat_tmp)]))
@@ -434,11 +646,18 @@ else:
     with cols[0]: st.pyplot(figM, use_container_width=True)
     with cols[1]: st.pyplot(figE, use_container_width=True)
 
-    # Equation row: span middle + right columns
-    spacer, eqcol = st.columns([1.2, 1.8])
-    with eqcol:
-        st.markdown("**Equation (fitted)**")
-        st.latex(latex_linear_numeric(reg_lin))
+    with cols[1]:
+        idx, m_true, m_pred = pick_maxae_in_keyboard_range(yte, yte_hat, note_band=NOTE_BAND, octaves=3)
+        if idx is not None:
+            st.markdown("**Max Error Within 3-Octave Organ**")
+            fig_kb = render_keyboard(m_true, m_pred, note_band=NOTE_BAND, octaves=3, fit_window=False)
+            st.pyplot(fig_kb, use_container_width=True)
+            plt.close(fig_kb)
+
+    # Final linear equation — centered across full width
+    st.markdown("---")
+    st.markdown("**Least Squares Regression Metamodel (Linear):**")
+    latex_center(latex_linear_numeric(reg_lin))
 
     st.divider()
 
@@ -446,55 +665,80 @@ else:
     st.markdown("### Polynomial Regression")
     cols = st.columns([1.2, 0.9, 0.9])
 
-    # Right panel: form choice + overlay + metrics + static list of forms
+    # Right panel: form choice + overlay + metrics
     with cols[2]:
+        st.markdown("**Options**")
+        poly_overlay_truth = st.checkbox("Overlay Dataset Note Frequencies", value=False, key="poly_overlay_truth")
         st.markdown("**Hyperparameters**")
         poly_choice = st.selectbox("Form", list(POLY_FORMS.keys()), index=2)  # default C
         form_key = POLY_FORMS[poly_choice]["key"]
-        poly_overlay_truth = st.checkbox("Overlay theoretical data", value=False, key="poly_overlay_truth")
+
         st.markdown("**Error metrics**")
-        # quick metrics using temp fit on current form
         tmp_reg, _ = fit_poly(Ltr, Dtr, ytr, form_key)
         yte_hat_tmp = predict_poly(tmp_reg, Lte, Dte, form_key) if len(Lte) else np.array([])
         st.table(pd.DataFrame([metrics_table(yte, yte_hat_tmp)]))
 
-        st.markdown("---")
-        st.markdown("**Polynomial Models:**")
-        st.latex(POLY_FORMS_LATEX["A_L_Ld"])
-        st.latex(POLY_FORMS_LATEX["B_Q_noLD"])
-        st.latex(POLY_FORMS_LATEX["C_Q_withLD"])
-        st.latex(POLY_FORMS_LATEX["D_Cubic_lite"])
+    # ABCD formulas — inline math, indented within the right pane
+    spacer, eqcol = st.columns([1.2, 1.8])
+    with eqcol:
+        PAD = 0.35
+        gutter, body = st.columns([PAD, 1 - PAD])
+        with body:
+            st.markdown("---")
+            st.markdown("**Polynomial Models:**")
+            st.markdown(r"**A:** $\displaystyle \hat f(L,d)=\beta_0+\beta_1L+\beta_2d+\beta_{12}Ld$")
+            st.markdown(r"**B:** $\displaystyle \hat f(L,d)=\beta_0+\beta_1L+\beta_2d+\beta_{11}L^2+\beta_{22}d^2$")
+            st.markdown(r"**C:** $\displaystyle \hat f(L,d)=\beta_0+\beta_1L+\beta_2d+\beta_{11}L^2+\beta_{22}d^2+\beta_{12}Ld$")
+            st.markdown(r"**D:** $\displaystyle \hat f(L,d)=\beta_0+\beta_1L+\beta_2d+\beta_{11}L^2+\beta_{22}d^2+\beta_{12}Ld+\beta_{111}L^3+\beta_{222}d^3$")
 
     # Fit + plots with selected form and overlay
     reg_poly, labels = fit_poly(Ltr, Dtr, ytr, form_key)
+    yte_hat_poly = predict_poly(reg_poly, Lte, Dte, form_key) if len(Lte) else np.array([])  # <-- add this
     grid_hat = predict_poly(reg_poly, gridL, gridD, form_key).reshape(Fg.shape)
+
     figM, figE = model_and_error_figs(Lg, Dg, Fg, grid_hat,
-                                      overlay_truth_notes=poly_overlay_truth,
-                                      title_prefix="Polynomial")
+                                    overlay_truth_notes=poly_overlay_truth,
+                                    title_prefix="Polynomial")
     with cols[0]: st.pyplot(figM, use_container_width=True)
     with cols[1]: st.pyplot(figE, use_container_width=True)
 
-    spacer, eqcol = st.columns([1.2, 1.8])
-    with eqcol:
-        st.markdown("**Equation**")
-        st.latex(latex_poly_numeric(reg_poly, labels))
+    with cols[1]:
+        idx, m_true, m_pred = pick_maxae_in_keyboard_range(yte, yte_hat_poly, note_band=NOTE_BAND, octaves=3)
+        if idx is not None:
+            st.markdown("**Max Error Within 3-Octave Organ**")
+            fig_kb = render_keyboard(m_true, m_pred, note_band=NOTE_BAND, octaves=3, fit_window=False)
+            st.pyplot(fig_kb, use_container_width=True)
+            plt.close(fig_kb)
+
+
+    # Final polynomial equation — centered across full width
+    st.markdown("---")
+    st.markdown("**Least Squares Regression Metamodel (Polynomial):**")
+    latex_center(latex_poly_numeric(reg_poly, labels))
 
     st.divider()
+
+
+
 
     # ===== GPR =============================================================
     st.markdown("### Gaussian Process Regression")
     cols = st.columns([1.2, 0.9, 0.9])
 
     with cols[2]:
+        st.markdown("**Options**")
+        gpr_overlay_truth = st.checkbox("Overlay Dataset Note Frequencies", value=False, key="gpr_overlay_truth")
+
         st.markdown("**Hyperparameters**")
-        kernel_name = st.selectbox("Kernel", ["RBF", "RationalQuadratic"],
-                                   help="RBF: smooth; RQ: multi-scale smoothness")
+        kernel_name = st.selectbox("Kernel", ["Radial Basis Function (RBF)", "Rational Quadratic (RQ)"],
+                                help="RBF: smooth; RQ: multi-scale smoothness")
         alpha_choice = st.select_slider("Noise",
-                          options=[1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3],
-                          value=1e-6, format_func=lambda v: f'{v:.0e}')
-        gpr_overlay_truth = st.checkbox("Overlay theoretical data", value=False, key="gpr_overlay_truth")
+                        options=[1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e1, 1e2],
+                        value=1e-1, format_func=lambda v: f'{v:.0e}')
+        st.markdown("---")
         st.markdown(r"RBF: $k(x,x')=\sigma^2\exp\!\left(-\tfrac12\sum_i \frac{(x_i-x'_i)^2}{\ell_i^2}\right)$")
         st.markdown(r"RQ:  $k(x,x')=\sigma^2\left(1+\frac{\|x-x'\|^2}{2\alpha\ell^2}\right)^{-\alpha}$")
+        st.markdown("RBF: smooth; RQ: multi-scale smoothness")
 
         # quick metrics with temp fit
         tmp_gpr = fit_gpr(Ltr, Dtr, ytr, kernel_name, alpha_choice)
@@ -502,25 +746,26 @@ else:
         st.markdown("**Error metrics**")
         st.table(pd.DataFrame([metrics_table(yte, yte_hat_tmp)]))
 
+    # train final model + predictions
     gpr = fit_gpr(Ltr, Dtr, ytr, kernel_name, alpha_choice)
+    yte_hat_gpr = predict_gpr(gpr, Lte, Dte) if len(Lte) else np.array([])   # <-- add this line
     grid_hat = predict_gpr(gpr, gridL, gridD).reshape(Fg.shape)
+
     figM, figE = model_and_error_figs(Lg, Dg, Fg, grid_hat,
-                                      overlay_truth_notes=gpr_overlay_truth,
-                                      title_prefix="GPR")
+                                    overlay_truth_notes=gpr_overlay_truth,
+                                    title_prefix="GPR")
     with cols[0]: st.pyplot(figM, use_container_width=True)
     with cols[1]: st.pyplot(figE, use_container_width=True)
 
-    spacer, eqcol = st.columns([1.2, 1.8])
-    with eqcol:
-        st.markdown("**Predictive mean**")
-        st.latex(r"\hat f(x) = k(x,X)\,[K(X,X)+\alpha I]^{-1}y")
+    # Keyboard under error plot (GPR)
+    with cols[1]:
+        idx, m_true, m_pred = pick_maxae_in_keyboard_range(yte, yte_hat_gpr, note_band=NOTE_BAND, octaves=3)
+        if idx is not None:
+            st.markdown("**Max Error Within 3-Octave Organ**")
+            fig_kb = render_keyboard(m_true, m_pred, note_band=NOTE_BAND, octaves=3, fit_window=False)
+            st.pyplot(fig_kb, use_container_width=True)
+            plt.close(fig_kb)
 
-# ----------------------- Sample-code placeholders --------------------------
-st.divider()
-c1, c2 = st.columns(2, gap="large")
-with c1:
-    st.subheader("DOE — sample code")
-    st.code("# sample code", language="python")
-with c2:
-    st.subheader("Models — sample code")
-    st.code("# sample code", language="python")
+
+
+
